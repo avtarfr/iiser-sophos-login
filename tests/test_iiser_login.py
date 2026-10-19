@@ -155,7 +155,7 @@ def kurooto(fake, tmp_path, monkeypatch):
     monkeypatch.setattr(
         il.shutil, "which", lambda name, *a, **k: str(exe) if name.startswith("kurooto") else which(name, *a, **k)
     )
-    return lambda: said.read_text().splitlines() if said.exists() else []
+    return lambda: said.read_text().replace('"', "").splitlines() if said.exists() else []  # cmd's echo keeps quotes
 
 
 def test_kurooto_needs_kurooto(fake, capsys):
