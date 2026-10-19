@@ -1,0 +1,31 @@
+[project]
+name = "iiser-sophos-login"
+version = "0.1.0"
+description = "Stay signed in to IISER Pune's campus network login (Sophos), on Windows, macOS and Linux."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Sumangalam Avtar Sharma" }]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+iiser-login = "iiser_login:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/iiser_login.py"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S"]
+ignore = ["S101", "S110", "S603", "S607"]  # S110: best-effort fallbacks are deliberate
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "E501"]
