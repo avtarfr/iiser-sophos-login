@@ -1,6 +1,6 @@
 [project]
 name = "iiser-sophos-login"
-version = "0.1.0"
+version = "0.2.0"
 description = "Stay signed in to IISER Pune's campus network login (Sophos), on Windows, macOS and Linux."
 readme = "README.md"
 license = "Apache-2.0"

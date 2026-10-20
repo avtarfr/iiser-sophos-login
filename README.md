@@ -7,11 +7,11 @@ and Linux. Not affiliated with IISER Pune.
 ## Install
 **Windows** (PowerShell):
 ```powershell
-irm https://raw.githubusercontent.com/avtarfr/iiser-sophos-login/v0.1.0/installer/install.ps1 | iex
+irm https://raw.githubusercontent.com/avtarfr/iiser-sophos-login/v0.2.0/installer/install.ps1 | iex
 ```
 **macOS / Linux**:
 ```sh
-curl -LsSf https://raw.githubusercontent.com/avtarfr/iiser-sophos-login/v0.1.0/installer/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/avtarfr/iiser-sophos-login/v0.2.0/installer/install.sh | sh
 ```
 It installs [uv](https://docs.astral.sh/uv/) if needed, then `iiser-login` for your user (no admin), asks for your
 campus username and password, and turns on autostart. Already have uv? `uv tool install

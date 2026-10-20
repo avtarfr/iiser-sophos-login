@@ -41,7 +41,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 HOST, PORT = "firewall.iiserpune.ac.in", 8090
 PORTAL = os.environ.get("IISER_LOGIN_PORTAL", f"https://{HOST}:{PORT}")  # tests point this at a fake
 PROBE = os.environ.get("IISER_LOGIN_PROBE", "http://connectivitycheck.gstatic.com/generate_204")
