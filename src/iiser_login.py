@@ -5,12 +5,17 @@ firewall.iiserpune.ac.in:8090), so the internet keeps working on campus Wi-Fi an
                                  (--username NAME --password-stdin: the same, for other programs)
     iiser-login                  sign in now, if the campus page is asking
     iiser-login keep             stay signed in: checks every minute, signs in when the page intercepts, and sends the
-                                 page's keep-alive every 3 minutes (what `autostart on` runs in the background)
+                                 page's keep-alive every 3 minutes (what `autostart on` runs in the background).
+                                 Where the network ends a session after a fixed time whatever the keep-alives say
+                                 (campus Wi-Fi: 30 minutes), once it has seen that twice it signs in again 2.5 minutes
+                                 before the end, so the internet doesn't drop
     iiser-login status           are you on campus, signed in, and are credentials saved
     iiser-login logout           sign out
     iiser-login autostart on|off|status    run `keep` whenever you sign in to this computer
     iiser-login forget           delete the saved credentials
     iiser-login kurooto on|off|status    tell you about sign-in problems through Kurooto (Telegram), if you use it
+    iiser-login interfaces all|NAME...|off|status    Linux: sign in on each campus link itself (ethernet, campus
+                                 Wi-Fi) even when the default route is elsewhere, e.g. a phone's hotspot
 
 Works on Windows, macOS and Linux with only Python's standard library. The password goes only to the campus portal
 (over HTTPS, certificate checked) and is never written to logs. Not affiliated with IISER Pune.
@@ -25,7 +30,9 @@ import http.client
 import os
 import re
 import shutil
+import socket
 import ssl
+import struct
 import subprocess
 import sys
 import time
@@ -40,6 +47,9 @@ PORTAL = os.environ.get("IISER_LOGIN_PORTAL", f"https://{HOST}:{PORT}")  # tests
 PROBE = os.environ.get("IISER_LOGIN_PROBE", "http://connectivitycheck.gstatic.com/generate_204")
 SERVICE = "iiser-sophos-login"
 LIVE_EVERY = 180  # the portal's own page sends a keep-alive every 180 s
+EARLY = float(os.environ.get("IISER_LOGIN_EARLY") or 150)  # sign in again this long before a fixed limit (0: don't)
+DNS_PORT = 53  # tests point this at a fake
+SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)  # Linux
 
 
 def home_dir(kind: str) -> Path:
@@ -248,14 +258,198 @@ def tell(text: str, key: str, every: float = 6 * 3600) -> bool:
     return r.returncode == 0
 
 
+# ---------------------------------------------------------------------------------------------- links
+# By default every request takes the default route, which is all most people need. On Linux, `iiser-login interfaces`
+# makes each request go out through a campus link itself (SO_BINDTODEVICE), so a laptop on both campus Wi-Fi and a
+# phone's hotspot (or on ethernet and Wi-Fi at once) keeps every campus link signed in. A link counts as campus when
+# its own DNS servers, asked through that link, know the firewall's name; that address is where its sign-in goes.
+_dns_cache: dict[str, tuple[str | None, float]] = {}  # interface -> (the firewall's address or None, when checked)
+_warned: set[str] = set()
+
+
+def bind_to() -> list[str] | None:
+    """The interfaces to sign in through, or None for the default route (the setting is Linux only)."""
+    try:
+        words = (CONFIG / "interfaces").read_text(encoding="utf-8").split()
+    except OSError:
+        return None
+    if not words or not sys.platform.startswith("linux"):
+        return None
+    return connected_links() if words == ["all"] else words
+
+
+def connected_links() -> list[str]:
+    """Connected ethernet and Wi-Fi interfaces: from NetworkManager, else the physical ones that are up."""
+    if shutil.which("nmcli"):
+        try:
+            out = subprocess.run(
+                ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "dev"], capture_output=True, text=True, timeout=10
+            ).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            out = ""
+        rows = [(line.split(":") + ["", ""])[:3] for line in out.splitlines()]
+        return [d for d, t, s in rows if t in ("ethernet", "wifi") and s.startswith("connected")]
+    found = []
+    for p in sorted(Path("/sys/class/net").glob("*")):
+        try:
+            up = (p / "operstate").read_text().strip() == "up"
+            ether = (p / "type").read_text().strip() == "1"  # ethernet and Wi-Fi alike
+        except OSError:
+            continue
+        if up and ether and (p / "device").exists():  # a real device, not a bridge, veth or VPN
+            found.append(p.name)
+    return found
+
+
+def link_dns(iface: str) -> list[str]:
+    """The DNS servers this link was given (NetworkManager or systemd-resolved), else the system's."""
+    ipv4 = r"\b\d{1,3}(?:\.\d{1,3}){3}\b"
+    for cmd in (["nmcli", "-g", "IP4.DNS", "dev", "show", iface], ["resolvectl", "dns", iface]):
+        if shutil.which(cmd[0]):
+            try:
+                found = re.findall(ipv4, subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout)
+            except (OSError, subprocess.TimeoutExpired):
+                found = []
+            if found:
+                return found
+    try:
+        return re.findall(rf"^\s*nameserver\s+({ipv4})", Path("/etc/resolv.conf").read_text(), re.M)
+    except OSError:
+        return []
+
+
+def bound(iface: str, kind: int = socket.SOCK_STREAM, timeout: float = 8) -> socket.socket:
+    """An IPv4 socket whose traffic leaves through `iface` whatever the routing table says (Linux)."""
+    s = socket.socket(socket.AF_INET, kind)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, iface.encode())
+    except OSError:
+        s.close()
+        raise
+    s.settimeout(timeout)
+    return s
+
+
+def _skip_name(r: bytes, i: int) -> int:
+    while r[i]:
+        if r[i] & 0xC0 == 0xC0:  # a pointer ends the name
+            return i + 2
+        i += r[i] + 1
+    return i + 1
+
+
+def dns_a(name: str, server: str, iface: str) -> str | None:
+    """One A-record lookup sent to `server` through `iface`; None if it has no address for `name`."""
+    qid = int.from_bytes(os.urandom(2), "big")
+    q = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    q += b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\0" + struct.pack(">HH", 1, 1)
+    s = bound(iface, socket.SOCK_DGRAM, 3)
+    try:
+        s.sendto(q, (server, DNS_PORT))
+        r = s.recv(2048)
+    finally:
+        s.close()
+    try:
+        rid, flags, qd, an = struct.unpack(">HHHH", r[:8])
+        if rid != qid or flags & 0x000F:  # not our answer, or an error (NXDOMAIN...)
+            return None
+        i = 12
+        for _ in range(qd):
+            i = _skip_name(r, i) + 4
+        for _ in range(an):
+            i = _skip_name(r, i)
+            typ, _, _, ln = struct.unpack(">HHIH", r[i : i + 10])
+            i += 10
+            if typ == 1 and ln == 4:
+                return socket.inet_ntoa(r[i : i + 4])
+            i += ln  # a CNAME on the way
+    except (struct.error, IndexError):
+        pass
+    return None
+
+
+def firewall_ip(iface: str) -> str | None:
+    """The firewall's address if `iface` is a campus link (its own DNS knows the firewall), else None."""
+    ip, at = _dns_cache.get(iface, (None, 0.0))
+    if time.time() - at < (3600 if ip else 300):
+        return ip
+    ip = None
+    for server in link_dns(iface):
+        try:
+            ip = dns_a(HOST, server, iface)
+        except PermissionError:
+            if iface not in _warned:
+                _warned.add(iface)
+                log(f"{iface}: not allowed to send through it (needs Linux 5.7 or newer, or CAP_NET_RAW)")
+            break
+        except OSError:
+            continue
+        if ip:
+            break
+    _dns_cache[iface] = (ip, time.time())
+    return ip
+
+
+def routes() -> list[tuple[str, str] | None]:
+    """Where to sign in: [None] (the default route), or each campus link as (interface, firewall address)."""
+    names = bind_to()
+    if names is None:
+        return [None]
+    return [(iface, ip) for iface in names for ip in [firewall_ip(iface)] if ip]
+
+
+class _BoundHTTP(http.client.HTTPConnection):
+    iface, addr = "", None
+
+    def connect(self):
+        self.sock = bound(self.iface, timeout=self.timeout)
+        self.sock.connect((self.addr or self.host, self.port))
+
+
+class _BoundHTTPS(http.client.HTTPSConnection):
+    iface, addr = "", None
+
+    def connect(self):  # to `addr`, but the certificate must be the portal's own name's
+        sock = bound(self.iface, timeout=self.timeout)
+        sock.connect((self.addr or self.host, self.port))
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def fetch(url: str, iface: str, method: str = "GET", data: bytes | None = None, addr: str | None = None, timeout=8):
+    """One request through `iface`, to `addr` when given (the firewall's campus address): (status, Location, body)."""
+    u = urllib.parse.urlsplit(url)
+    if u.scheme == "https":
+        conn = _BoundHTTPS(u.hostname, u.port or 443, timeout=timeout, context=ssl.create_default_context())
+    else:
+        conn = _BoundHTTP(u.hostname, u.port or 80, timeout=timeout)
+    conn.iface, conn.addr = iface, addr
+    headers = {"User-Agent": f"iiser-login/{__version__}", "Connection": "close"}
+    if data is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    try:
+        conn.request(method, u.path + (f"?{u.query}" if u.query else ""), body=data, headers=headers)
+        r = conn.getresponse()
+        return r.status, r.getheader("Location") or "", r.read(65536).decode("utf-8", "replace")
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------------------------- portal
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **k):
         return None
 
 
-def probe() -> str:
+def probe(iface: str | None = None) -> str:
     """'online' (the internet answered), 'portal' (the campus page intercepted it) or 'offline'."""
+    if iface:
+        try:
+            status, loc, body = fetch(PROBE, iface)
+        except (OSError, http.client.HTTPException):
+            return "offline"
+        if status == 204:
+            return "online"
+        return "portal" if HOST in loc or HOST in body or "8090" in body else "offline"
     opener = urllib.request.build_opener(NoRedirect)
     try:
         with opener.open(PROBE, timeout=8) as r:  # noqa: S310 (a fixed http URL: captive-portal check)
@@ -275,8 +469,12 @@ def probe() -> str:
         return "offline"
 
 
-def portal(method: str, path: str, form: dict | None = None) -> str:
+def portal(method: str, path: str, form: dict | None = None, via: tuple[str, str] | None = None) -> str:
     data = urllib.parse.urlencode(form or {}).encode() if method == "POST" else None
+    if via:  # through that link, to the address its campus DNS gave for the firewall
+        iface, ip = via
+        addr = ip if urllib.parse.urlsplit(PORTAL).hostname == HOST else None
+        return fetch(f"{PORTAL}{path}", iface, method, data, addr, timeout=10)[2]
     req = urllib.request.Request(  # noqa: S310 (the campus portal's https address, or a test's)
         f"{PORTAL}{path}", data=data, method=method, headers={"User-Agent": f"iiser-login/{__version__}"}
     )
@@ -294,40 +492,41 @@ def stamp() -> str:
     return str(int(time.time() * 1000))
 
 
-def login(user: str, pw: str) -> tuple[bool, str]:
+def login(user: str, pw: str, via: tuple[str, str] | None = None) -> tuple[bool, str]:
     xml = portal(
-        "POST", "/login.xml", {"mode": "191", "username": user, "password": pw, "a": stamp(), "producttype": "0"}
+        "POST", "/login.xml", {"mode": "191", "username": user, "password": pw, "a": stamp(), "producttype": "0"}, via
     )
     status, msg = tag(xml, "status"), tag(xml, "message").replace("{username}", user)
     return status == "LIVE", msg or status or "no answer"
 
 
-def keepalive(user: str) -> str:
+def keepalive(user: str, via: tuple[str, str] | None = None) -> str:
     q = urllib.parse.urlencode({"mode": "192", "username": user, "a": stamp(), "producttype": "0"})
-    return tag(portal("GET", f"/live?{q}"), "ack")  # ack | nack | login_again | live_off
+    return tag(portal("GET", f"/live?{q}", via=via), "ack")  # ack | nack | login_again | live_off
 
 
-def logout(user: str) -> str:
+def logout(user: str, via: tuple[str, str] | None = None) -> str:
     form = {"mode": "193", "username": user, "a": stamp(), "producttype": "0"}
-    return tag(portal("POST", "/logout.xml", form), "message")
+    return tag(portal("POST", "/logout.xml", form, via), "message")
 
 
 # ---------------------------------------------------------------------------------------------- actions
-def sign_in(kc: Keychain) -> bool:
+def sign_in(kc: Keychain, via: tuple[str, str] | None = None, why: str = "") -> bool:
     user, pw = kc.username(), kc.password()
+    on = f"{via[0]}: " if via else ""  # which link, when signing in on each one
     if not user or not pw:
         log("no credentials saved: run `iiser-login setup`")
         return False
     try:
-        ok, msg = login(user, pw)
+        ok, msg = login(user, pw, via)
     except (OSError, http.client.HTTPException) as e:
-        log(f"couldn't reach the campus portal: {e}")
+        log(f"{on}couldn't reach the campus portal: {e}")
         tell(
             "The campus login page asked to sign in, but couldn't be reached. The internet may be down here.",
             key="unreachable",
         )
         return False
-    log("signed in" if ok else f"sign-in refused: {msg}")
+    log(f"{on}signed in{why}" if ok else f"{on}sign-in refused: {msg}")
     if not ok:
         tell(
             f"The campus network refused the sign-in ({msg}). If your password changed, run: iiser-login setup",
@@ -336,32 +535,87 @@ def sign_in(kc: Keychain) -> bool:
     return ok
 
 
-def keep(kc: Keychain, once: bool = False) -> None:
+def session_limits() -> dict[str, tuple[float, float | None]]:
+    """From the log, per link ("" for the default route): (when it was last signed in because the page intercepted,
+    the fixed session length it enforces or None). A length is known once the last two gaps between such sign-ins
+    agree within 2 minutes and are between 10 minutes and 3 hours."""
+    seen: dict[str, list[float]] = {}
+    try:
+        lines = (STATE / "log.txt").read_text(encoding="utf-8").splitlines()[-400:]
+    except OSError:
+        lines = []
+    for line in lines:
+        m = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (?:(\S+): )?signed in$", line)
+        if m:
+            seen.setdefault(m.group(2) or "", []).append(dt.datetime.fromisoformat(m.group(1)).timestamp())
+    out = {}
+    for link, ts in seen.items():
+        gaps = [b - a for a, b in zip(ts, ts[1:])][-2:]
+        fixed = len(gaps) == 2 and abs(gaps[0] - gaps[1]) <= 120 and all(600 <= g <= 3 * 3600 for g in gaps)
+        out[link] = (ts[-1], min(gaps) - 60 if fixed else None)  # -60: a gap includes up to a minute of noticing
+    return out
+
+
+def keep_link(kc: Keychain, via: tuple[str, str] | None, limit_of: dict, last_live: dict, early: dict) -> float:
+    """One look at one link: sign in if the page intercepts, ahead of a fixed limit, or keep it alive. Returns how
+    soon to look again: every minute, or every 3 s around the end of a fixed-length session."""
+    link, iface = (via[0], via[0]) if via else ("", None)
+    forced_at, limit = limit_of.get(link, (0.0, None))
+    e = early.get(link, {})
+    start = max(forced_at, e.get("at", 0.0))
+    now = time.time()
+    on_campus = via or now - last_live.get(link, 0.0) < 2 * LIVE_EVERY  # the default route may be off campus
+    if limit and EARLY > 0 and e.get("works") is not False and on_campus:
+        if start + limit - EARLY <= now <= start + limit + 120 and probe(iface) == "online":
+            if sign_in(kc, via, f" again, ahead of the {round(limit / 60)}-minute limit"):
+                early[link] = e = {"at": time.time(), "works": e.get("works")}
+                last_live[link] = time.time()
+    state = probe(iface)
+    if state == "portal":
+        if limit and e.get("at") and time.time() - e["at"] < limit / 2:
+            early[link] = e = {"works": False}  # it still ended on the old clock: just look often around the end
+            log(f"{link + ': ' if via else ''}signing in early doesn't extend the session here; watching closely")
+        if sign_in(kc, via):
+            last_live[link] = time.time()
+            if e.get("works") is not False:
+                early.pop(link, None)
+    elif state == "online" and time.time() - last_live.get(link, 0.0) >= LIVE_EVERY:
+        try:
+            ack = keepalive(kc.username(), via)
+            last_live[link] = time.time()
+            if ack in ("nack", "login_again"):
+                log(f"{link + ': ' if via else ''}the portal asked to sign in again")
+                sign_in(kc, via)
+        except (OSError, http.client.HTTPException):
+            pass  # off campus: the portal isn't there; nothing to keep alive
+    if limit:
+        left = max(forced_at, early.get(link, {}).get("at", 0.0)) + limit + 60 - time.time()
+        if -120 <= left <= 180:
+            return 3
+    return 60
+
+
+def keep(kc: Keychain, once: bool = False, rounds: int | None = None) -> None:
     log("keeping the campus network signed in")
-    last_live, told = 0.0, False
+    last_live: dict[str, float] = {}
+    early: dict[str, dict] = {}  # link -> when it was last signed in ahead of the limit, and whether that helped
+    told, n = False, 1 if once else rounds
     while True:
+        nap = 60.0
         if not kc.username():
             if not told:
                 log("no credentials saved yet: run `iiser-login setup`")
                 told = True
         else:
             told = False
-            state = probe()
-            if state == "portal":
-                if sign_in(kc):
-                    last_live = time.time()
-            elif state == "online" and time.time() - last_live >= LIVE_EVERY:
-                try:
-                    ack = keepalive(kc.username())
-                    last_live = time.time()
-                    if ack in ("nack", "login_again"):
-                        log("the portal asked to sign in again")
-                        sign_in(kc)
-                except (OSError, http.client.HTTPException):
-                    pass  # off campus: the portal isn't there; nothing to keep alive
-        if once:
-            return
-        time.sleep(60)
+            limit_of = session_limits()
+            for via in routes():
+                nap = min(nap, keep_link(kc, via, limit_of, last_live, early))
+        if n is not None:
+            n -= 1
+            if n <= 0:
+                return
+        time.sleep(nap)
 
 
 # ------------------------------------------------------------------------------------------- autostart
@@ -438,6 +692,31 @@ def autostart(action: str) -> str:
     return "on" if unit.exists() else "off"
 
 
+def interfaces(args: list[str]) -> str:
+    """Sign in through chosen interfaces (Linux): `all` connected ethernet and Wi-Fi, some by name, or `off`."""
+    f = CONFIG / "interfaces"
+    if args in ([], ["status"]):
+        try:
+            words = f.read_text(encoding="utf-8").split()
+        except OSError:
+            words = []
+        if not words:
+            return "off (the default route)"
+        return "every connected ethernet and Wi-Fi link" if words == ["all"] else " ".join(words)
+    if args == ["off"]:
+        f.unlink(missing_ok=True)
+        return "Off: it signs in over the default route."
+    if not sys.platform.startswith("linux"):
+        return "Signing in through a chosen interface needs Linux; here it always uses the default route."
+    bad = [w for w in args if not re.fullmatch(r"[\w.@-]{1,15}", w) or (w == "all" and len(args) > 1)]
+    if bad:
+        return f"Not an interface name: {' '.join(bad)} (try `ip link` for the names)."
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    f.write_text(" ".join(args) + "\n", encoding="utf-8")
+    which = "every connected ethernet and Wi-Fi link" if args == ["all"] else " ".join(args)
+    return f"On: it signs in on each campus link itself ({which}), whatever the default route."
+
+
 # ------------------------------------------------------------------------------------------------- main
 def main(argv: list[str] | None = None) -> int:
     a = sys.argv[1:] if argv is None else argv
@@ -494,18 +773,29 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "keep":
         keep(kc)
         return 0
+    names = bind_to()
     if cmd == "status":
-        print(f"network: {probe()} (online = signed in or off campus; portal = the campus page is asking)")
+        if names is None:
+            print(f"network: {probe()} (online = signed in or off campus; portal = the campus page is asking)")
+        for iface in names or []:
+            ip = firewall_ip(iface)
+            print(f"{iface}: campus, {probe(iface)} (firewall {ip})" if ip else f"{iface}: not campus")
+        if names == []:
+            print("no connected ethernet or Wi-Fi")
         print(f"credentials: {'saved for ' + kc.username() if kc.username() else 'none (iiser-login setup)'}")
         print(f"autostart: {autostart('status')}")
         print(f"kurooto: {kurooto('status')}")
+        print(f"interfaces: {interfaces([])}")
         return 0
     if cmd == "logout":
         if not kc.username():
             print("No credentials saved.")
             return 1
         try:
-            print(logout(kc.username()) or "Signed out.")
+            if names is None:
+                print(logout(kc.username()) or "Signed out.")
+            for via in routes() if names is not None else []:
+                print(f"{via[0]}: {logout(kc.username(), via) or 'signed out'}")
         except (OSError, http.client.HTTPException) as e:
             print(f"Couldn't reach the campus portal: {e}")
             return 1
@@ -516,9 +806,22 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "autostart":
         print(autostart(a[1] if len(a) > 1 and a[1] in ("on", "off", "status") else "status"))
         return 0
+    if cmd == "interfaces":
+        print(interfaces(a[1:]))
+        return 0
     if cmd:
         print(__doc__)
         return 2
+    if names is not None:  # each campus link on its own
+        found, ok = routes(), True
+        for via in found:
+            if probe(via[0]) == "online":
+                print(f"{via[0]}: already signed in")
+            else:
+                ok = sign_in(kc, via) and ok
+        if not found:
+            print("No campus link right now (ethernet or campus Wi-Fi).")
+        return 0 if found and ok else 1
     state = probe()
     if state == "online":
         print("Already online (signed in, or not on campus).")

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import socket
+import struct
 import sys
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -177,3 +181,112 @@ def test_problems_reach_you_through_kurooto(kurooto, capsys):
     il.main(["status"])
     assert "kurooto: on" in capsys.readouterr().out
     assert il.main(["kurooto", "off"]) == 0 and il.kurooto("status") == "off"
+
+
+# ------------------------------------------------------------------ a fixed session length (campus Wi-Fi)
+def _forced_sign_ins(ago: list[float], link: str = "") -> None:
+    """Log lines for sign-ins the page forced, this many seconds ago."""
+    il.STATE.mkdir(parents=True, exist_ok=True)
+    with open(il.STATE / "log.txt", "a", encoding="utf-8") as f:
+        for s in ago:
+            f.write(
+                f"{dt.datetime.fromtimestamp(time.time() - s):%Y-%m-%d %H:%M:%S} {link + ': ' if link else ''}signed in\n"
+            )
+        f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} keeping the campus network signed in\n")
+
+
+def test_session_limit_is_learned_from_the_log(fake):
+    _forced_sign_ins([3 * 1740 + 100, 2 * 1740 + 100, 1740 + 100, 100])
+    _forced_sign_ins([5000, 3000, 100], link="wlan0")  # gaps of 2000 s and 2900 s: no fixed length
+    limits = il.session_limits()
+    assert abs(limits[""][1] - (1740 - 60)) <= 1 and abs(limits[""][0] - (time.time() - 100)) <= 2
+    assert limits["wlan0"][1] is None
+
+
+def test_signs_in_again_ahead_of_a_fixed_limit(fake, monkeypatch):
+    kc = il.Keychain()
+    kc.save("student", "s3cret pa$$")
+    _forced_sign_ins([1600 + 2 * 1740, 1600 + 1740, 1600])  # ended every 29 min; this session began 1600 s ago
+    fake.signed_in = True
+    naps = []
+
+    def nap(s):
+        naps.append(s)
+        if len(naps) == 2:
+            fake.signed_in = False  # this network ends it on the old clock all the same
+
+    monkeypatch.setattr(il.time, "sleep", nap)
+    il.keep(kc, rounds=3)
+    log = (il.STATE / "log.txt").read_text()
+    assert "signed in again, ahead of the 28-minute limit" in log and "s3cret" not in log
+    assert naps[0] == 3  # close to the end it looks every few seconds
+    assert "doesn't extend the session here" in log and log.rstrip().endswith(" signed in") and fake.signed_in
+
+
+def test_off_campus_it_does_not_sign_in_ahead(fake, monkeypatch):
+    kc = il.Keychain()
+    kc.save("student", "s3cret pa$$")
+    _forced_sign_ins([1600 + 2 * 1740, 1600 + 1740, 1600])
+    fake.signed_in = True  # online, but the portal isn't there
+    monkeypatch.setattr(il, "PORTAL", "http://127.0.0.1:1")
+    monkeypatch.setattr(il.time, "sleep", lambda s: None)
+    il.keep(kc, rounds=2)
+    assert "couldn't reach" not in (il.STATE / "log.txt").read_text() and fake.calls == []
+
+
+# ----------------------------------------------------------------- each campus link itself (Linux only)
+class FakeDNS:
+    """Answers the firewall's name with 127.0.0.1 (after a CNAME, as some resolvers do), anything else NXDOMAIN."""
+
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.port, self.asked = self.sock.getsockname()[1], []
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        while True:
+            try:
+                q, peer = self.sock.recvfrom(2048)
+            except OSError:
+                return
+            i, labels = 12, []
+            while q[i]:
+                labels.append(q[i + 1 : i + 1 + q[i]].decode())
+                i += q[i] + 1
+            name, question = ".".join(labels), q[12 : i + 5]
+            self.asked.append(name)
+            if name == il.HOST:
+                target = b"\x06portal\x07example\x00"
+                answers = b"\xc0\x0c" + struct.pack(">HHIH", 5, 1, 60, len(target)) + target
+                answers += b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) + socket.inet_aton("127.0.0.1")
+                head = q[:2] + struct.pack(">HHHHH", 0x8180, 1, 2, 0, 0)
+            else:
+                answers, head = b"", q[:2] + struct.pack(">HHHHH", 0x8183, 1, 0, 0, 0)
+            self.sock.sendto(head + question + answers, peer)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="SO_BINDTODEVICE is Linux's")
+def test_signs_in_through_a_chosen_interface(fake, monkeypatch, capsys):
+    dns = FakeDNS()
+    monkeypatch.setattr(il, "DNS_PORT", dns.port)
+    monkeypatch.setattr(il, "link_dns", lambda iface: ["127.0.0.1"])
+    monkeypatch.setattr(il, "_dns_cache", {})
+    port = urllib.parse.urlsplit(fake.base).port
+    monkeypatch.setattr(il, "PORTAL", f"http://{il.HOST}:{port}")  # reached at the address the link's own DNS gives
+    s = il.bound("lo")
+    assert s.getsockopt(socket.SOL_SOCKET, il.SO_BINDTODEVICE, 16).rstrip(b"\0") == b"lo"
+    s.close()
+    assert "Not an interface name" in il.interfaces(["eth0;", "x"])
+    assert il.main(["interfaces", "lo"]) == 0 and "On:" in capsys.readouterr().out and il.bind_to() == ["lo"]
+    kc = il.Keychain()
+    kc.save("student", "s3cret pa$$")
+    assert il.main([]) == 0 and fake.signed_in and il.HOST in dns.asked
+    assert "lo: signed in" in (il.STATE / "log.txt").read_text()
+    il.keep(kc, once=True)
+    assert ("live", "192") in fake.calls
+    il.main(["status"])
+    assert "lo: campus, online (firewall 127.0.0.1)" in capsys.readouterr().out
+    assert il.dns_a("elsewhere.example", "127.0.0.1", "lo") is None  # its DNS doesn't know it: not a campus link
+    assert il.main(["logout"]) == 0 and not fake.signed_in
+    assert il.main(["interfaces", "off"]) == 0 and il.bind_to() is None
